@@ -173,6 +173,11 @@ func (p *Phone) Deny(ctx context.Context, id string) error {
 	return p.do(ctx, http.MethodPost, "/api/web/requests/"+id+"/deny", struct{}{}, nil)
 }
 
+func (p *Phone) Devboxes(ctx context.Context) ([]protocol.WebDevbox, error) {
+	var out []protocol.WebDevbox
+	return out, p.do(ctx, http.MethodGet, "/api/web/devboxes", nil, &out)
+}
+
 func (p *Phone) Enrollments(ctx context.Context) ([]protocol.WebEnrollment, error) {
 	var out []protocol.WebEnrollment
 	return out, p.do(ctx, http.MethodGet, "/api/web/enrollments", nil, &out)

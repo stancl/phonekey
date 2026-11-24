@@ -122,6 +122,15 @@ type WebEnrollment struct {
 	ExpiresAt int64 `json:"expires_at"`
 }
 
+// WebDevbox is a registered dev box as listed on the page.
+type WebDevbox struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt int64  `json:"created_at"`
+	// LastSeenAt is the time of its last dev box API call, if any.
+	LastSeenAt int64 `json:"last_seen_at,omitempty"`
+}
+
 // WebRequest is a pending request as shown to the approval page.
 type WebRequest struct {
 	ID          string          `json:"id"`

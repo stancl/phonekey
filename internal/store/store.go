@@ -299,6 +299,7 @@ func (s *Store) Devboxes(ctx context.Context) ([]Devbox, error) {
 	return out, rows.Err()
 }
 
+// RemoveDevbox deletes a dev box, and its requests with it.
 func (s *Store) RemoveDevbox(ctx context.Context, name string) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM devboxes WHERE name = ?`, name)
 	if err != nil {
@@ -308,6 +309,16 @@ func (s *Store) RemoveDevbox(ctx context.Context, name string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// RemoveDevboxByID is RemoveDevbox by id, returning the name.
+func (s *Store) RemoveDevboxByID(ctx context.Context, id int64) (string, error) {
+	var name string
+	err := s.db.QueryRowContext(ctx, `DELETE FROM devboxes WHERE id = ? RETURNING name`, id).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return name, err
 }
 
 // Enrollments

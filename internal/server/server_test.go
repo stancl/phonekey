@@ -682,3 +682,45 @@ func TestEnrollExpiry(t *testing.T) {
 		t.Fatalf("expired enrollment still listed: %+v", list)
 	}
 }
+
+func TestRemoveDevbox(t *testing.T) {
+	e := setup(t, server.Config{})
+	ctx := context.Background()
+	if _, err := e.backend.Keys(ctx); err != nil {
+		t.Fatal(err)
+	}
+	created, err := e.backend.Create(ctx, protocol.CreateRequest{PublicKey: e.phone.PublicKey(), Data: sshsigBlob("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.phone.Login(ctx); err != nil {
+		t.Fatal(err)
+	}
+	boxes, err := e.phone.Devboxes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(boxes) != 1 || boxes[0].Name != "devbox" || boxes[0].LastSeenAt == 0 {
+		t.Fatalf("dev boxes: %+v", boxes)
+	}
+
+	// Removing it revokes its token and takes its pending request along.
+	if err := e.phone.Delete(ctx, fmt.Sprintf("/api/web/devboxes/%d", boxes[0].ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.backend.Keys(ctx); err == nil || !strings.Contains(err.Error(), "unknown dev box token") {
+		t.Fatalf("removed dev box's token: %v", err)
+	}
+	if p, _ := e.phone.Pending(ctx); len(p) != 0 {
+		t.Fatalf("removed dev box's requests still pending: %+v", p)
+	}
+	if err := e.backend.Cancel(ctx, created.ID); err == nil {
+		t.Fatal("removed dev box can still reach its request")
+	}
+	if boxes, _ := e.phone.Devboxes(ctx); len(boxes) != 0 {
+		t.Fatalf("dev boxes after removal: %+v", boxes)
+	}
+	if err := e.phone.Delete(ctx, fmt.Sprintf("/api/web/devboxes/%d", boxes[0].ID)); err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("removing it twice: %v", err)
+	}
+}

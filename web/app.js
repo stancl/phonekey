@@ -399,6 +399,7 @@ function connectEvents() {
   es.addEventListener("enrollments", (ev) => {
     state.enrollments = JSON.parse(ev.data);
     renderEnrollments();
+    if ($("devboxes-details").open) renderDevboxes().catch(setError);
   });
   es.addEventListener("requests", (ev) => {
     $("conn").textContent = "live";
@@ -718,6 +719,38 @@ async function removeKey(k) {
   render();
 }
 
+async function renderDevboxes() {
+  if (!state.config.logged_in) return;
+  const boxes = await api("GET", "/api/web/devboxes");
+  $("enroll-command").textContent = `phonekey-agent enroll --backend ${location.origin}`;
+  const items = boxes.map((d) => {
+    const seen = d.last_seen_at ? `last seen ${new Date(d.last_seen_at * 1000).toLocaleString()}` : "never seen";
+    return h(
+      "li",
+      { class: "key-row" },
+      h(
+        "div",
+        {},
+        h("strong", {}, d.name),
+        h("div", { class: "card-meta" }, `added ${new Date(d.created_at * 1000).toLocaleDateString()} · ${seen}`),
+      ),
+      h("button", { class: "danger small", onclick: () => removeDevbox(d).catch(setError) }, "Remove"),
+    );
+  });
+  $("devboxes").replaceChildren(...(items.length ? items : [h("li", { class: "muted" }, "None yet.")]));
+}
+
+// removeDevbox revokes a dev box's token. Its requests are stored with it, so
+// they go too.
+async function removeDevbox(d) {
+  const lines = [`Remove the dev box "${d.name}"?`, ""];
+  lines.push("Its token stops working, so it can't ask for signatures any more. Its pending requests and its entries in Recent go with it.");
+  lines.push("", "To use it again, delete its token file and enroll it again.");
+  if (!confirm(lines.join("\n"))) return;
+  await api("DELETE", `/api/web/devboxes/${d.id}`);
+  await renderDevboxes();
+}
+
 function renderGrantOptions() {
   const sel = $("grant-seconds");
   const max = state.config.max_grant_seconds;
@@ -762,6 +795,7 @@ function render() {
   show("pair", !loggedIn);
   show("requests", loggedIn);
   show("setup", loggedIn);
+  show("devboxes-section", loggedIn);
   show("history-section", loggedIn);
   $("pair-label").placeholder = /iPhone|iPad/.test(navigator.userAgent) ? "iPhone (iCloud Keychain)" : "passkey";
   if (loggedIn) {
@@ -894,6 +928,7 @@ async function main() {
     renderEnv();
   });
   $("history-details").addEventListener("toggle", (e) => e.target.open && renderHistory().catch(setError));
+  $("devboxes-details").addEventListener("toggle", (e) => e.target.open && renderDevboxes().catch(setError));
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) endGrant();
     else if (state.events?.readyState === EventSource.CLOSED) {

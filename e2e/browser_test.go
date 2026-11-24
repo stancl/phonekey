@@ -356,6 +356,28 @@ func TestBrowser(t *testing.T) {
 	)
 	verifyDiag(t, text(t, browser, "diag-out"), "noble")
 
+	// Dev boxes lists the enrolled one, and removing it revokes its token.
+	do(t, browser,
+		chromedp.Evaluate[chromedp.Void](`document.getElementById('diag-details').open = false`),
+		chromedp.Evaluate[chromedp.Void](`document.getElementById('devboxes-details').open = true`),
+		chromedp.WaitVisible(chromedp.CSS("#devboxes .key-row")),
+	)
+	if got := text(t, browser, "devboxes"); !strings.Contains(got, "browser-devbox") || !strings.Contains(got, "last seen") {
+		t.Fatalf("dev boxes list %q", got)
+	}
+	if got := text(t, browser, "enroll-command"); got != "phonekey-agent enroll --backend "+url {
+		t.Fatalf("enroll command %q", got)
+	}
+	shot(t, browser, "5b-devboxes")
+	do(t, browser,
+		chromedp.Evaluate[chromedp.Void](`window.confirm = () => true`),
+		chromedp.Click(chromedp.CSS("#devboxes .key-row button")),
+		chromedp.WaitNotPresent(chromedp.CSS("#devboxes .key-row")),
+	)
+	if _, err := devbox.Keys(ctx); err == nil {
+		t.Fatal("removed dev box's token still works")
+	}
+
 	// Removing keys from the page. Two accidental keys get paired; removing
 	// one leaves this session alone, removing the key this page logged in
 	// with logs it out, and the other key's session carries on.

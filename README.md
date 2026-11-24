@@ -474,6 +474,14 @@ ln -sfn ~/.ssh/phonekey.pub ~/.ssh/active_auth.pub
   - The passkey itself stays in your password manager, and the key on GitHub
     if you added it there; remove those separately.
   - `phonekeyd keys rm` does the same from the command line.
+- **Dev boxes** lists the registered dev boxes, with when each was added and
+  when its agent last reached the backend, and the command that enrolls
+  another one.
+  - **Remove** revokes one: its token stops working, and its pending requests
+    and its entries in Recent go with it.
+  - This needs no passkey: like denying a request, it only takes access away.
+  - To use a removed dev box again, delete its token file and enroll it again.
+  - `phonekeyd devbox rm` does the same from the command line.
 - **Logins per command.** `jj git clone` logs in twice, so it asks twice
   unless you use *Approve + rest*.
 - **Agent log.** A refused signature shows up twice in the agent's log: once
@@ -547,7 +555,7 @@ deletes resolved ones after `--retention` (7 days).
 | `internal/agent/client.go` | the dev box API client |
 | `cmd/phonekey-agent/enroll.go` | `phonekey-agent enroll`: asking the backend to register the dev box |
 | `cmd/phonekey-keygen` | the jj shim; also points git and jj at the agent's socket without `SSH_AUTH_SOCK` |
-| `web/app.js` | the page: pairing, login, approvals, grants, push, Recent, diagnostics |
+| `web/app.js` | the page: pairing, login, approvals, dev box enrollments and removal, grants, push, Recent, diagnostics |
 | `web/ed25519.js`, `web/sshsig.js` | key derivation and signing; SSH wire encoding and SSHSIG armor |
 | `web/sw.js` | the service worker: shows a notification for every push, opens the request on click |
 | `web/vendor/noble-ed25519.js` | `@noble/ed25519` 3.2.0, unmodified (integrity hash in `web/vendor/README.md`) |
@@ -576,6 +584,7 @@ deletes resolved ones after `--retention` (7 days).
   - `requests`, `history`, `events` (SSE)
   - `requests/{id}/signature`, `requests/{id}/deny`
   - `keys/{id}` (DELETE)
+  - `devboxes`, `devboxes/{id}` (DELETE)
   - `enrollments`, `enrollments/{id}/approve`, `enrollments/{id}/deny`
   - `push/subscribe`, `push/test`
 
@@ -588,7 +597,8 @@ deletes resolved ones after `--retention` (7 days).
   an existing session plus an *approval*: a registered key's signature over a
   fresh nonce. Removing a key and approving a dev box's enrollment need an
   approval too. A session cookie on its own can read and deny requests and
-  enrollments, but can't change the registered keys or add dev boxes.
+  enrollments and remove dev boxes, but can't change the registered keys or
+  add dev boxes.
 - **Enrollment codes.** The backend makes up a code for each enrollment and
   hands it to the dev box, which prints it, and to the page. Someone else
   asking at the same moment gets a different code.
@@ -722,9 +732,11 @@ deletes resolved ones after `--retention` (7 days).
 - **A stolen session cookie** can read pending requests (commands, commit
   messages, server names) and deny them. It can't sign: signing needs the
   passkey. It can't add or remove keys, or approve a dev box: that needs a
-  passkey approval.
+  passkey approval. It can remove dev boxes, which cuts them off until you
+  enroll them again, and also deletes their requests from Recent.
 - **A stolen dev box token** can only queue requests, which you'd see and could
-  deny. To recover: `devbox rm`.
+  deny. To recover: remove the dev box on the page (or `devbox rm`), and enroll
+  it again.
 - **Compared with 1Password's agent.** Both give one signature per approval and
   never put the key on the dev box. phonekey shows what's being signed. It's
   weaker in that the page's code can derive the key, while 1Password's key
@@ -858,6 +870,7 @@ nix flake check                # the unit tests in Nix's sandbox, with the packa
   - enrolling the dev box: the page showing the dev box's code, approving
   - a second enrollment under the same name shown as a replacement, denied
   - approving `ssh-keygen` signatures, and late arrivals not being preselected
+  - removing the dev box
   - removing keys: another key, then the one the page is logged in with
   - *Approve + rest* covering a rebase, and no grant offered for a one-shot
   - Recent

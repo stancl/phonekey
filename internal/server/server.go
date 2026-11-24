@@ -178,6 +178,8 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/web/requests/{id}/signature", s.sameOrigin(s.session(s.submitSignature)))
 	m.HandleFunc("POST /api/web/requests/{id}/deny", s.sameOrigin(s.session(s.denyRequest)))
 	m.HandleFunc("DELETE /api/web/keys/{id}", s.sameOrigin(s.session(s.removeKey)))
+	m.HandleFunc("GET /api/web/devboxes", s.session(s.listDevboxes))
+	m.HandleFunc("DELETE /api/web/devboxes/{id}", s.sameOrigin(s.session(s.removeDevbox)))
 	m.HandleFunc("GET /api/web/enrollments", s.session(s.listEnrollments))
 	m.HandleFunc("POST /api/web/enrollments/{id}/approve", s.sameOrigin(s.session(s.approveEnrollment)))
 	m.HandleFunc("POST /api/web/enrollments/{id}/deny", s.sameOrigin(s.session(s.denyEnrollment)))
@@ -800,6 +802,37 @@ func (s *Server) removeKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("key removed", "fingerprint", k.Fingerprint, "label", k.Label)
+	s.events.notify()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) listDevboxes(w http.ResponseWriter, r *http.Request) {
+	ds, err := s.store.Devboxes(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	out := make([]protocol.WebDevbox, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, protocol.WebDevbox{ID: d.ID, Name: d.Name, CreatedAt: d.CreatedAt, LastSeenAt: d.LastSeenAt.Int64})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// removeDevbox revokes a dev box's token. It needs no passkey: it only takes
+// access away, as denying a request does.
+func (s *Server) removeDevbox(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.fail(w, r, store.ErrNotFound)
+		return
+	}
+	name, err := s.store.RemoveDevboxByID(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.log.Info("dev box removed", "name", name)
 	s.events.notify()
 	w.WriteHeader(http.StatusNoContent)
 }
