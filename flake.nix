@@ -344,10 +344,34 @@
       # The dev box side: phonekey-agent as a systemd user service for the
       # listed users, each with their own backend, plus ssh pointed at it for
       # chosen hosts. git and jj sign through phonekey-keygen, which finds the
-      # agent's socket by itself, so nothing needs SSH_AUTH_SOCK.
-      nixosModules.phonekey-agent = { config, lib, pkgs, ... }:
+      # agent's socket by itself, so nothing needs SSH_AUTH_SOCK. The same
+      # module serves nix-darwin (darwinModules.phonekey-agent), with a launchd
+      # agent for the user unit.
+      nixosModules.phonekey-agent = { config, lib, options, pkgs, ... }:
         let
           cfg = config.programs.phonekey-agent;
+          # Which modules imported this, from the options alone, so not from
+          # config, which this decides.
+          darwin = options ? launchd;
+          # The agent's socket, as ssh_config writes it. macOS has no
+          # XDG_RUNTIME_DIR, where the agent puts it by default, so there the
+          # settings file names it.
+          socket = if darwin then "~/.ssh/phonekey-agent.sock" else "/run/user/%i/phonekey-agent.sock";
+          # One launchd agent for every user, as there's one user unit: it
+          # runs the agent only for the listed users, once their token exists,
+          # with their settings file's environment.
+          darwinStart = pkgs.writeShellScript "phonekey-agent-start" ''
+            settings=/etc/phonekey/agent/$(/usr/bin/id -un).env
+            [ -r "$settings" ] || exit 0
+            # As ConditionPathExists, but launchd has none: wait for the token.
+            while [ ! -e "$HOME/.config/phonekey/token" ]; do sleep 60; done
+            # As EnvironmentFile: values stay literal, the agent expands $HOME.
+            while IFS= read -r line; do
+              if [ -n "$line" ]; then export "$line"; fi
+            done <"$settings"
+            exec >>"$HOME/Library/Logs/phonekey-agent.log" 2>&1
+            exec ${lib.getExe cfg.package}
+          '';
           # A configured key path as a shell word, with ~/ meaning $HOME.
           shellPath = path:
             if lib.hasPrefix "~/" path then ''"$HOME"/${lib.escapeShellArg (lib.removePrefix "~/" path)}''
@@ -454,7 +478,7 @@
             };
           };
 
-          config = lib.mkIf (cfg.users != { }) {
+          config = lib.mkIf (cfg.users != { }) ({
             # Per-user settings, read by the one user unit below via %u. The
             # token itself stays in the user's home directory.
             environment.etc = lib.mapAttrs' (name: u: lib.nameValuePair "phonekey/agent/${name}.env" {
@@ -463,9 +487,31 @@
                 PHONEKEY_TOKEN_FILE=$HOME/.config/phonekey/token
               '' + lib.optionalString (u.upstream != null) ''
                 PHONEKEY_UPSTREAM=${u.upstream}
+              '' + lib.optionalString darwin ''
+                PHONEKEY_SOCKET=$HOME/.ssh/phonekey-agent.sock
               '';
             }) cfg.users;
 
+            users.users = lib.mapAttrs (name: u: { packages = [ cfg.package (use name u) ]; }) cfg.users;
+
+            programs.ssh.extraConfig = lib.concatStrings (lib.mapAttrsToList (name: u:
+              lib.optionalString (u.ssh.hosts != [ ]) ''
+                Match localuser ${name} host ${lib.concatStringsSep "," u.ssh.hosts}
+                  IdentityAgent ${socket}
+                  IdentityFile ~/.ssh/active_auth.pub
+                  IdentitiesOnly yes
+              '') cfg.users);
+          } // (if darwin then {
+            launchd.user.agents.phonekey-agent.serviceConfig = {
+              ProgramArguments = [ "${darwinStart}" ];
+              RunAtLoad = true;
+              # Again after a crash or a failed start, not after exit 0: a
+              # user without settings, or a clean stop.
+              KeepAlive.SuccessfulExit = false;
+              ThrottleInterval = 30;
+              ProcessType = "Background";
+            };
+          } else {
             systemd.user.services.phonekey-agent = {
               description = "phonekey ssh-agent";
               wantedBy = [ "default.target" ];
@@ -479,18 +525,12 @@
                 RestartSec = 5;
               };
             };
-
-            users.users = lib.mapAttrs (name: u: { packages = [ cfg.package (use name u) ]; }) cfg.users;
-
-            programs.ssh.extraConfig = lib.concatStrings (lib.mapAttrsToList (name: u:
-              lib.optionalString (u.ssh.hosts != [ ]) ''
-                Match localuser ${name} host ${lib.concatStringsSep "," u.ssh.hosts}
-                  IdentityAgent /run/user/%i/phonekey-agent.sock
-                  IdentityFile ~/.ssh/active_auth.pub
-                  IdentitiesOnly yes
-              '') cfg.users);
-          };
+          }));
         };
+
+      # The agent for nix-darwin: the module above, with the same options.
+      darwinModules.phonekey-agent = self.nixosModules.phonekey-agent;
+      darwinModules.default = self.darwinModules.phonekey-agent;
 
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {

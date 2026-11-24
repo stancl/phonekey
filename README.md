@@ -293,6 +293,14 @@ missing, so start it once it's there (`systemctl --user start phonekey-agent`);
 later logins start it by themselves.
 [QUICKSTART.md](QUICKSTART.md) shows it in full.
 
+On macOS with nix-darwin, `phonekey.darwinModules.phonekey-agent` takes the
+same options, with a launchd agent for the systemd user service. It runs for
+the listed users once the token is there, waiting for it until then, and logs
+to `~/Library/Logs/phonekey-agent.log`. macOS has no `XDG_RUNTIME_DIR`, so the
+socket is `~/.ssh/phonekey-agent.sock`, where `ssh.hosts` point too.
+phonekey-keygen doesn't look there by itself: set `PHONEKEY_SOCKET` to it, or
+`SSH_AUTH_SOCK`, for git and jj to sign through the agent.
+
 Elsewhere, a systemd user unit is enough (no root needed). For example,
 `~/.config/systemd/user/phonekey-agent.service`:
 
