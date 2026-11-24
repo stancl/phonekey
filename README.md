@@ -254,14 +254,29 @@ as an **Authentication key** and as a **Signing key**.
 
 ### 3. Run the agent on each dev box
 
-On the backend host, register the dev box and copy the token it prints. The
-backend stores only a hash, so the token can't be shown again.
+On the dev box, ask the backend to register it:
 
 ```sh
-phonekeyd --db … devbox add mybox > mybox.token     # NixOS: sudo phonekeyd-ctl <instance> devbox add mybox
+phonekey-agent enroll --backend https://phonekey.<tailnet>.ts.net [--name mybox]
 ```
 
-On the dev box:
+- **Approving.** The page shows an *Add a dev box* card, with a notification,
+  and the code the command printed. If the codes match, tap **Approve**, which
+  asks for the passkey. The command then writes the dev box's token to
+  `~/.config/phonekey/token` (`--token-file`) and exits.
+- **The name** defaults to the hostname, and may contain letters, digits,
+  `.`, `-` and `_`. Enrolling under a name that's already registered, e.g.
+  after a reinstall, replaces that dev box: the card and notification say
+  *Replace a dev box*, and approving gives the name to the new one. The old
+  token stops working, and Recent keeps the old entries under the name.
+- **From the backend host** instead: `devbox add` registers a dev box and
+  prints its token. The backend stores only a hash, so the token can't be shown
+  again.
+  ```sh
+  phonekeyd --db … devbox add mybox > mybox.token     # NixOS: sudo phonekeyd-ctl <instance> devbox add mybox
+  ```
+
+Then run the agent:
 
 ```sh
 phonekey-agent --backend https://phonekey.<tailnet>.ts.net --token-file ~/.config/phonekey/token \
@@ -285,12 +300,12 @@ On NixOS, `phonekey.nixosModules.phonekey-agent` sets this up per user:
 `programs.phonekey-agent.users.<name> = { backend = …; upstream = …; }` gives
 that user:
 - the agent as a systemd user service
-- the binaries and a `phonekey-use` switching helper
+- the binaries, a `phonekey-use` switching helper, and `phonekey-enroll`
 - ssh using the agent for chosen hosts (`ssh.hosts`, default `github.com`)
 
-The token goes in `~/.config/phonekey/token`. The service is skipped while it's
-missing, so start it once it's there (`systemctl --user start phonekey-agent`);
-later logins start it by themselves.
+The service is skipped while `~/.config/phonekey/token` is missing.
+`phonekey-enroll` enrolls the dev box with the configured backend, writes the
+token there and (re)starts the service; later logins start it by themselves.
 [QUICKSTART.md](QUICKSTART.md) shows it in full.
 
 Elsewhere, a systemd user unit is enough (no root needed). For example,
@@ -523,13 +538,14 @@ deletes resolved ones after `--retention` (7 days).
 | `internal/server/server.go` | HTTP API, CSP and security headers, sessions, the event stream (SSE), long-polls, the push hold-back |
 | `internal/server/push.go` | VAPID keys (generated on first start and kept in the database), Web Push delivery, dropping dead subscriptions |
 | `internal/server/summary.go` | the one-line summary used for notifications and card titles |
-| `internal/store` | SQLite (`modernc.org/sqlite`, no cgo): keys, dev boxes, pairing codes, nonces, sessions, push subscriptions, requests |
+| `internal/store` | SQLite (`modernc.org/sqlite`, no cgo): keys, dev boxes and their enrollments, pairing codes, nonces, sessions, push subscriptions, requests |
 | `internal/sshwire` | parsing userauth payloads, SSHSIG blobs and `session-bind@openssh.com` |
 | `internal/protocol` | JSON types shared by the backend, the agent and the simulator |
 | `cmd/phonekey-agent`, `internal/agent/agent.go` | the ssh-agent: per-connection state, upstream proxying, deadline, cancel on disconnect, session-bind policy |
 | `internal/agent/context.go`, `proc_linux.go` | finding the requesting process (`SO_PEERCRED`, `/proc`), the scope, ssh destination and git action, reading git's commit file |
 | `internal/agent/knownhosts.go` | naming the server from known_hosts, including hashed entries |
 | `internal/agent/client.go` | the dev box API client |
+| `cmd/phonekey-agent/enroll.go` | `phonekey-agent enroll`: asking the backend to register the dev box |
 | `cmd/phonekey-keygen` | the jj shim; also points git and jj at the agent's socket without `SSH_AUTH_SOCK` |
 | `web/app.js` | the page: pairing, login, approvals, grants, push, Recent, diagnostics |
 | `web/ed25519.js`, `web/sshsig.js` | key derivation and signing; SSH wire encoding and SSHSIG armor |
@@ -549,12 +565,18 @@ deletes resolved ones after `--retention` (7 days).
 
   Each dev box has its own token. The backend stores only a hash of it. A dev
   box can only poll or cancel its own requests.
+- **Enrolling**, the one dev box call without a token: `POST /api/devbox/enroll`
+  with a name returns a new token and a code. The token works once the
+  enrollment is approved. Until then it's only good for
+  `GET /api/devbox/enroll?wait=N`, which waits for the outcome, and
+  `DELETE /api/devbox/enroll`, which withdraws it (Ctrl-C).
 - **Web API**, authenticated with a session cookie:
   - `config`
   - `nonce`, `login`, `pair`, `logout`
   - `requests`, `history`, `events` (SSE)
   - `requests/{id}/signature`, `requests/{id}/deny`
   - `keys/{id}` (DELETE)
+  - `enrollments`, `enrollments/{id}/approve`, `enrollments/{id}/deny`
   - `push/subscribe`, `push/test`
 
   All paths are under `/api/web/`.
@@ -564,8 +586,12 @@ deletes resolved ones after `--retention` (7 days).
   therefore needs no Face ID; signing always does.
 - **Pairing** registers a new key. It needs a one-time code from `pair-code`, or
   an existing session plus an *approval*: a registered key's signature over a
-  fresh nonce. Removing a key needs an approval too. A session cookie on its
-  own can read and deny requests, but can't change the registered keys.
+  fresh nonce. Removing a key and approving a dev box's enrollment need an
+  approval too. A session cookie on its own can read and deny requests and
+  enrollments, but can't change the registered keys or add dev boxes.
+- **Enrollment codes.** The backend makes up a code for each enrollment and
+  hands it to the dev box, which prints it, and to the page. Someone else
+  asking at the same moment gets a different code.
 - **One user, many keys.** Any registered key can log in and sees everything.
   Each web session, and each push subscription made from it, belongs to the
   key that logged in. The page re-sends its existing subscription after each
@@ -639,8 +665,8 @@ deletes resolved ones after `--retention` (7 days).
 - **Key material** is wiped after each use: the PRF output, the seed copies, and
   the PKCS#8 buffer used to import the seed. A grant's key is wiped once its
   last signature is done.
-- **Approvals.** Adding a key without a pairing code, and removing one, first
-  ask for a registered passkey.
+- **Approvals.** Adding a key without a pairing code, removing one, and
+  approving a dev box's enrollment first ask for a registered passkey.
 
 ## Threat model
 
@@ -673,6 +699,14 @@ deletes resolved ones after `--retention` (7 days).
   the dev box writes the whole commit, message and change id included. What
   protects you is approving only what you just triggered: the timing, the
   command and the count.
+- **Enrolling dev boxes.** Anyone who can reach phonekeyd can ask to be
+  enrolled, and you get a notification. Approving takes the passkey, so a
+  stolen session cookie can't. Compare the code on the card with the one the
+  dev box printed: an enrollment someone else sent at the same time shows a
+  different one. An approved dev box gets what any dev box has: it can queue
+  requests and read the registered public keys. One that replaces a
+  registered dev box cuts that one off, and its requests show under the
+  name you knew. Such cards are titled *Replace a dev box* and say so.
 - **Hosts you forward the agent to** (`ssh -A`) can request signatures too.
   Their requests are marked *Forwarded* and never auto-signed by a grant.
 - **SSH logins.** Session binding limits signatures to real sessions with the
@@ -687,7 +721,8 @@ deletes resolved ones after `--retention` (7 days).
   Then pair again.
 - **A stolen session cookie** can read pending requests (commands, commit
   messages, server names) and deny them. It can't sign: signing needs the
-  passkey. It can't add or remove keys: that needs a passkey approval.
+  passkey. It can't add or remove keys, or approve a dev box: that needs a
+  passkey approval.
 - **A stolen dev box token** can only queue requests, which you'd see and could
   deny. To recover: `devbox rm`.
 - **Compared with 1Password's agent.** Both give one signature per approval and
@@ -696,7 +731,13 @@ deletes resolved ones after `--retention` (7 days).
   never leaves 1Password.
 
 Not handled:
-- rate limits: `nonce` is unauthenticated, and every request sends a push
+- rate limits: `nonce` is unauthenticated, and every request sends a push.
+  `enroll` is unauthenticated too. At most 3 enrollments can be asked for
+  within 5 minutes, however they end, so they send at most 3 pushes in that
+  time. Someone using them up blocks enrolling for that long. Web pages a
+  browser on the tailnet opens can't ask: `enroll` only takes JSON, which a
+  browser won't send to another site without a CORS preflight, and phonekeyd
+  doesn't allow any.
 - push endpoints aren't restricted to known push services, so self-hosted
   ones work. A stolen session could therefore make the backend send blind POSTs
   to any HTTPS address it can reach. The body is an encrypted notification, and
@@ -814,6 +855,8 @@ nix flake check                # the unit tests in Nix's sandbox, with the packa
 - **`TestBrowser`** drives the real page in headless Chromium, with a virtual
   authenticator that supports PRF:
   - pairing, and the JS key derivation matching Go
+  - enrolling the dev box: the page showing the dev box's code, approving
+  - a second enrollment under the same name shown as a replacement, denied
   - approving `ssh-keygen` signatures, and late arrivals not being preselected
   - removing keys: another key, then the one the page is logged in with
   - *Approve + rest* covering a rebase, and no grant offered for a one-shot

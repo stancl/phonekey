@@ -25,6 +25,12 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "enroll" {
+		if err := enroll(os.Args[2:]); err != nil {
+			fatal(err)
+		}
+		return
+	}
 	home, _ := os.UserHomeDir()
 	// No fallback to a shared directory like /tmp, where another account
 	// could create the socket path first.
@@ -43,6 +49,12 @@ func main() {
 	knownHosts := flag.String("known-hosts", filepath.Join(home, ".ssh/known_hosts")+",/etc/ssh/ssh_known_hosts",
 		"comma-separated known_hosts files used to name servers (read only)")
 	verbose := flag.Bool("v", false, "debug logging")
+	flag.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: phonekey-agent [flags]\n"+
+			"       phonekey-agent enroll [--backend URL] [--token-file FILE] [--name NAME]\n"+
+			"         ask phonekeyd to register this dev box, approved on the phone\n\n")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 	// Paths may refer to $HOME or $XDG_RUNTIME_DIR, e.g. from a settings file
 	// shared by several users.
@@ -71,7 +83,7 @@ func main() {
 		token = strings.TrimSpace(string(b))
 	}
 	if token == "" {
-		fatal(errors.New("no dev box token: use --token-file or $PHONEKEY_TOKEN"))
+		fatal(errors.New("no dev box token: use --token-file or $PHONEKEY_TOKEN, or get one with `phonekey-agent enroll`"))
 	}
 	backend := &agent.Backend{URL: *backendURL, Token: token, HTTP: &http.Client{Timeout: time.Minute}}
 

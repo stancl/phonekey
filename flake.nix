@@ -385,6 +385,14 @@
             ln -sfn "$auth" "$auth_link"
             show
           '';
+          # phonekey-enroll asks the user's phonekeyd to register this dev box,
+          # and (re)starts the agent with the new token once that's approved
+          # on the phone.
+          enroll = u: pkgs.writeShellScriptBin "phonekey-enroll" ''
+            ${lib.getExe cfg.package} enroll --backend ${lib.escapeShellArg u.backend} \
+              --token-file "$HOME/.config/phonekey/token" "$@" || exit
+            ${config.systemd.package}/bin/systemctl --user restart phonekey-agent
+          '';
           # A key for signing and logging in, or one key for both.
           identity = lib.types.coercedTo lib.types.str (path: { sign = path; auth = path; }) (lib.types.submodule {
             options = {
@@ -469,8 +477,9 @@
             systemd.user.services.phonekey-agent = {
               description = "phonekey ssh-agent";
               wantedBy = [ "default.target" ];
-              # Starts only for the listed users, once they've stored their dev
-              # box token (kept out of the Nix store) in ~/.config/phonekey/token.
+              # Starts only for the listed users, once they have a dev box token
+              # (kept out of the Nix store) in ~/.config/phonekey/token, e.g.
+              # from phonekey-enroll.
               unitConfig.ConditionPathExists = [ "/etc/phonekey/agent/%u.env" "%h/.config/phonekey/token" ];
               serviceConfig = {
                 EnvironmentFile = "/etc/phonekey/agent/%u.env";
@@ -480,7 +489,7 @@
               };
             };
 
-            users.users = lib.mapAttrs (name: u: { packages = [ cfg.package (use name u) ]; }) cfg.users;
+            users.users = lib.mapAttrs (name: u: { packages = [ cfg.package (use name u) (enroll u) ]; }) cfg.users;
 
             programs.ssh.extraConfig = lib.concatStrings (lib.mapAttrsToList (name: u:
               lib.optionalString (u.ssh.hosts != [ ]) ''

@@ -24,6 +24,7 @@ import (
 
 	"phonekey/internal/agent"
 	"phonekey/internal/keyderive"
+	"phonekey/internal/protocol"
 	"phonekey/internal/server"
 	"phonekey/internal/sim"
 	"phonekey/internal/store"
@@ -68,7 +69,6 @@ func TestBrowser(t *testing.T) {
 	// WebAuthn needs a domain, not an IP, and localhost counts as secure.
 	url := "http://localhost:" + port
 
-	token, _ := st.AddDevbox(ctx, "browser-devbox")
 	code, _ := st.NewPairCode(ctx, time.Minute)
 
 	alloc, cancel := chromedp.NewExecAllocator(ctx, append(chromedp.DefaultExecAllocatorOptions[:],
@@ -140,6 +140,43 @@ func TestBrowser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The dev box enrolls itself: the page shows the code it got, and
+	// approving takes the passkey.
+	devbox := &agent.Backend{URL: url}
+	enrolled, err := devbox.Enroll(ctx, protocol.EnrollRequest{Name: "browser-devbox", Host: "devbox.example", User: "you"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	devbox.Token = enrolled.Token
+	do(t, browser, chromedp.WaitVisible(chromedp.CSS("#enrollment-list .card")))
+	if got := evalAsync[string](t, browser, `Promise.resolve(document.querySelector('#enrollment-list .enroll-code').textContent)`); got != enrolled.Code {
+		t.Fatalf("page shows code %q, dev box got %q", got, enrolled.Code)
+	}
+	shot(t, browser, "1b-enrollment")
+	do(t, browser,
+		chromedp.Click(chromedp.CSS("#enrollment-list .card-actions button")),
+		chromedp.WaitNotPresent(chromedp.CSS("#enrollment-list .card")),
+	)
+	if st, err := devbox.WaitEnrollment(browser); err != nil || st.Status != protocol.StatusApproved {
+		t.Fatalf("enrollment: %+v, %v (page error: %s)", st, err, pageError(browser))
+	}
+
+	// Enrolling under the same name asks to replace it, which the card makes
+	// plain. Deny keeps the dev box as it is.
+	again := &agent.Backend{URL: url}
+	if _, err := again.Enroll(ctx, protocol.EnrollRequest{Name: "browser-devbox"}); err != nil {
+		t.Fatal(err)
+	}
+	do(t, browser, chromedp.WaitVisible(chromedp.CSS("#enrollment-list .card .warning")))
+	if got := evalAsync[string](t, browser, `Promise.resolve([...document.querySelectorAll('#enrollment-list .card-title, #enrollment-list .card-actions button')].map((e) => e.textContent).join(", "))`); got != "Replace a dev box, Replace, Deny" {
+		t.Fatalf("replacing card: %q", got)
+	}
+	shot(t, browser, "1c-replacement")
+	do(t, browser,
+		chromedp.Click(chromedp.CSS("#enrollment-list .card-actions button.danger")),
+		chromedp.WaitNotPresent(chromedp.CSS("#enrollment-list .card")),
+	)
+
 	pubFile := filepath.Join(dir, "phone.pub")
 	os.WriteFile(pubFile, []byte(keys[0].PublicKey+"\n"), 0o644)
 	allowed := filepath.Join(dir, "allowed_signers")
@@ -153,7 +190,7 @@ func TestBrowser(t *testing.T) {
 	}
 	defer aln.Close()
 	go agent.New(agent.Config{
-		Backend:  &agent.Backend{URL: url, Token: token},
+		Backend:  devbox,
 		Keys:     func() []ssh.PublicKey { return []ssh.PublicKey{pk} },
 		Deadline: 30 * time.Second,
 		Logger:   testLogger(t),

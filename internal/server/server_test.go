@@ -500,3 +500,185 @@ func TestRemoveKey(t *testing.T) {
 		t.Fatalf("removing the last key: %v", err)
 	}
 }
+
+func TestEnroll(t *testing.T) {
+	e := setup(t, server.Config{MaxEnrollments: 10})
+	ctx := context.Background()
+	enroll := func(name string) (*agent.Backend, *protocol.EnrollResponse) {
+		t.Helper()
+		b := &agent.Backend{URL: e.url}
+		resp, err := b.Enroll(ctx, protocol.EnrollRequest{Name: name, Host: "box.example", User: "you"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Token = resp.Token
+		return b, resp
+	}
+	wait := func(b *agent.Backend) string {
+		t.Helper()
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		st, err := b.WaitEnrollment(wctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.Status
+	}
+
+	// A new dev box asks; the page lists it with the code the dev box shows,
+	// and its token doesn't work yet.
+	box, resp := enroll("laptop")
+	if err := e.phone.Login(ctx); err != nil {
+		t.Fatal(err)
+	}
+	list, err := e.phone.Enrollments(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Name != "laptop" || list[0].Code != resp.Code || list[0].Host != "box.example" || list[0].Replaces {
+		t.Fatalf("enrollments: %+v", list)
+	}
+	if _, err := box.Keys(ctx); err == nil {
+		t.Fatal("token works before approval")
+	}
+
+	// A session alone can't approve it; a passkey approval can.
+	if err := e.phone.Post(ctx, "/api/web/enrollments/"+list[0].ID+"/approve", protocol.Approved{}, nil); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("approving without a passkey: %v", err)
+	}
+	if err := e.phone.ApproveEnrollment(ctx, list[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if st := wait(box); st != protocol.StatusApproved {
+		t.Fatalf("approved enrollment: %s", st)
+	}
+	if _, err := box.Keys(ctx); err != nil {
+		t.Fatalf("approved token: %v", err)
+	}
+	if err := e.phone.ApproveEnrollment(ctx, list[0].ID); err == nil || !strings.Contains(err.Error(), "409") {
+		t.Fatalf("approving twice: %v", err)
+	}
+
+	// Enrolling under a registered name replaces that dev box's token.
+	again, _ := enroll("devbox")
+	list, _ = e.phone.Enrollments(ctx)
+	if len(list) != 1 || !list[0].Replaces {
+		t.Fatalf("re-enrollment: %+v", list)
+	}
+	if err := e.phone.ApproveEnrollment(ctx, list[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	wait(again)
+	if _, err := e.backend.Keys(ctx); err == nil {
+		t.Fatal("replaced token still works")
+	}
+	if _, err := again.Keys(ctx); err != nil {
+		t.Fatalf("replacing token: %v", err)
+	}
+	if ds, _ := e.store.Devboxes(ctx); len(ds) != 2 {
+		t.Fatalf("dev boxes: %+v", ds)
+	}
+
+	// Denied and withdrawn enrollments leave nothing usable behind.
+	denied, _ := enroll("denied")
+	withdrawn, _ := enroll("withdrawn")
+	list, _ = e.phone.Enrollments(ctx)
+	if err := e.phone.DenyEnrollment(ctx, list[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if st := wait(denied); st != protocol.StatusDenied {
+		t.Fatalf("denied enrollment: %s", st)
+	}
+	if st, err := withdrawn.CancelEnrollment(ctx); err != nil || st.Status != protocol.StatusCancelled {
+		t.Fatalf("withdrawing: %+v, %v", st, err)
+	}
+	if st := wait(withdrawn); st != protocol.StatusCancelled {
+		t.Fatalf("withdrawn enrollment: %s", st)
+	}
+	for _, b := range []*agent.Backend{denied, withdrawn} {
+		if _, err := b.Keys(ctx); err == nil {
+			t.Fatal("unapproved token works")
+		}
+	}
+	if list, _ := e.phone.Enrollments(ctx); len(list) != 0 {
+		t.Fatalf("resolved enrollments still pending: %+v", list)
+	}
+
+	// Withdrawing after the approval came in reports the approval, so the dev
+	// box can still keep the token.
+	late, _ := enroll("late")
+	list, _ = e.phone.Enrollments(ctx)
+	if err := e.phone.ApproveEnrollment(ctx, list[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := late.CancelEnrollment(ctx); err != nil || st.Status != protocol.StatusApproved {
+		t.Fatalf("withdrawing after approval: %+v, %v", st, err)
+	}
+
+	// Names are hostname-like, so one can't pose as a code on the card.
+	for _, name := range []string{"", " ", "laptop, code ABCD-EFGH", "a\u202eb", strings.Repeat("x", 65)} {
+		if _, err := (&agent.Backend{URL: e.url}).Enroll(ctx, protocol.EnrollRequest{Name: name}); err == nil {
+			t.Errorf("enrolled as %q", name)
+		}
+	}
+
+	// A web page can't ask: a cross-site POST can't be JSON without a
+	// preflight.
+	res, err := http.Post(e.url+"/api/devbox/enroll", "text/plain", strings.NewReader(`{"name":"drive-by"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("text/plain enrollment: %s", res.Status)
+	}
+}
+
+func TestEnrollLimit(t *testing.T) {
+	e := setup(t, server.Config{MaxEnrollments: 2})
+	ctx := context.Background()
+	enroll := func() (*agent.Backend, error) {
+		b := &agent.Backend{URL: e.url}
+		resp, err := b.Enroll(ctx, protocol.EnrollRequest{Name: "spam"})
+		if err == nil {
+			b.Token = resp.Token
+		}
+		return b, err
+	}
+	// Withdrawn enrollments still count, or asking and withdrawing in a
+	// loop would send a push each time without ever reaching the cap.
+	for range 2 {
+		b, err := enroll()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.CancelEnrollment(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := enroll(); err == nil || !strings.Contains(err.Error(), "too many") {
+		t.Fatalf("enrollment past the limit: %v", err)
+	}
+}
+
+func TestEnrollExpiry(t *testing.T) {
+	e := setup(t, server.Config{EnrollTTL: time.Second})
+	ctx := context.Background()
+	b := &agent.Backend{URL: e.url}
+	resp, err := b.Enroll(ctx, protocol.EnrollRequest{Name: "slow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Token = resp.Token
+	wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if st, err := b.WaitEnrollment(wctx); err != nil || st.Status != protocol.StatusExpired {
+		t.Fatalf("expired enrollment: %+v, %v", st, err)
+	}
+	if err := e.phone.Login(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := e.phone.Enrollments(ctx); len(list) != 0 {
+		t.Fatalf("expired enrollment still listed: %+v", list)
+	}
+}

@@ -138,7 +138,7 @@ func (p *Phone) RemoveKey(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	return p.do(ctx, http.MethodDelete, fmt.Sprintf("/api/web/keys/%d", id), protocol.RemoveKeyRequest{Approval: a}, nil)
+	return p.do(ctx, http.MethodDelete, fmt.Sprintf("/api/web/keys/%d", id), protocol.Approved{Approval: a}, nil)
 }
 
 func (p *Phone) Login(ctx context.Context) error {
@@ -173,6 +173,24 @@ func (p *Phone) Deny(ctx context.Context, id string) error {
 	return p.do(ctx, http.MethodPost, "/api/web/requests/"+id+"/deny", struct{}{}, nil)
 }
 
+func (p *Phone) Enrollments(ctx context.Context) ([]protocol.WebEnrollment, error) {
+	var out []protocol.WebEnrollment
+	return out, p.do(ctx, http.MethodGet, "/api/web/enrollments", nil, &out)
+}
+
+// ApproveEnrollment registers a dev box, approved with this phone's key.
+func (p *Phone) ApproveEnrollment(ctx context.Context, id string) error {
+	a, err := p.Approval(ctx)
+	if err != nil {
+		return err
+	}
+	return p.do(ctx, http.MethodPost, "/api/web/enrollments/"+id+"/approve", protocol.Approved{Approval: a}, nil)
+}
+
+func (p *Phone) DenyEnrollment(ctx context.Context, id string) error {
+	return p.do(ctx, http.MethodPost, "/api/web/enrollments/"+id+"/deny", struct{}{}, nil)
+}
+
 // Watch streams the pending list from /api/web/events, calling fn each time
 // it changes, until ctx is done or fn returns an error.
 func (p *Phone) Watch(ctx context.Context, fn func([]protocol.WebRequest) error) error {
@@ -183,13 +201,20 @@ func (p *Phone) Watch(ctx context.Context, fn func([]protocol.WebRequest) error)
 	defer resp.Body.Close()
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64<<10), 16<<20)
+	var event string
 	var data strings.Builder
 	for sc.Scan() {
 		line := sc.Text()
 		switch {
+		case strings.HasPrefix(line, "event:"):
+			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 		case strings.HasPrefix(line, "data:"):
 			data.WriteString(strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
 		case line == "" && data.Len() > 0:
+			if event != "requests" {
+				data.Reset()
+				continue
+			}
 			var reqs []protocol.WebRequest
 			if err := json.Unmarshal([]byte(data.String()), &reqs); err != nil {
 				return err

@@ -26,8 +26,13 @@ var ErrNotFound = errors.New("not found")
 // leave no way to log in without a new pairing code.
 var ErrLastKey = errors.New("can't remove the last key")
 
-// ErrNotPending is returned when resolving a request that's already resolved.
+// ErrNotPending is returned when resolving a request or an enrollment that's
+// already resolved.
 var ErrNotPending = errors.New("request is not pending")
+
+// ErrTooManyEnrollments is returned by CreateEnrollment when too many were
+// asked for lately.
+var ErrTooManyEnrollments = errors.New("too many dev box enrollments lately; try again in a few minutes")
 
 type Store struct {
 	db *sql.DB
@@ -52,6 +57,18 @@ CREATE TABLE IF NOT EXISTS devboxes (
 	token_hash   TEXT NOT NULL UNIQUE,
 	created_at   INTEGER NOT NULL,
 	last_seen_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS enrollments (
+	id          TEXT PRIMARY KEY,
+	name        TEXT NOT NULL,
+	host        TEXT NOT NULL,
+	user        TEXT NOT NULL,
+	token_hash  TEXT NOT NULL UNIQUE,
+	code        TEXT NOT NULL,
+	status      TEXT NOT NULL,
+	created_at  INTEGER NOT NULL,
+	expires_at  INTEGER NOT NULL,
+	resolved_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS pair_codes (
 	code_hash  TEXT PRIMARY KEY,
@@ -239,9 +256,13 @@ type Devbox struct {
 	LastSeenAt sql.NullInt64
 }
 
+func newDevboxToken() string {
+	return "pkd_" + RandomToken(24)
+}
+
 // AddDevbox registers a dev box and returns its bearer token.
 func (s *Store) AddDevbox(ctx context.Context, name string) (string, error) {
-	token := "pkd_" + RandomToken(24)
+	token := newDevboxToken()
 	_, err := s.db.ExecContext(ctx, `INSERT INTO devboxes(name, token_hash, created_at) VALUES(?, ?, ?)`,
 		name, hash(token), now())
 	return token, err
@@ -287,6 +308,118 @@ func (s *Store) RemoveDevbox(ctx context.Context, name string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// Enrollments
+
+type Enrollment struct {
+	protocol.WebEnrollment
+	Status string
+}
+
+// CreateEnrollment records a dev box asking to be registered. The returned
+// token only works once the enrollment is approved. It fails with
+// ErrTooManyEnrollments if max were asked for within the last ttl, however
+// they ended.
+func (s *Store) CreateEnrollment(ctx context.Context, req protocol.EnrollRequest, ttl time.Duration, max int) (*protocol.EnrollResponse, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var recent int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM enrollments WHERE created_at > ?`,
+		time.Now().Add(-ttl).Unix()).Scan(&recent); err != nil {
+		return nil, err
+	}
+	if recent >= max {
+		return nil, ErrTooManyEnrollments
+	}
+	code := strings.ToUpper(RandomToken(5))
+	resp := &protocol.EnrollResponse{
+		ID:        RandomToken(16),
+		Token:     newDevboxToken(),
+		Code:      code[:4] + "-" + code[4:],
+		ExpiresAt: time.Now().Add(ttl).Unix(),
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO enrollments
+		(id, name, host, user, token_hash, code, status, created_at, expires_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		resp.ID, req.Name, req.Host, req.User, hash(resp.Token), resp.Code, protocol.StatusPending, now(), resp.ExpiresAt); err != nil {
+		return nil, err
+	}
+	return resp, tx.Commit()
+}
+
+const enrollmentCols = `id, name, host, user, code, status, created_at, expires_at,
+	EXISTS(SELECT 1 FROM devboxes WHERE devboxes.name = enrollments.name)`
+
+func scanEnrollment(row interface{ Scan(...any) error }) (*Enrollment, error) {
+	var e Enrollment
+	err := row.Scan(&e.ID, &e.Name, &e.Host, &e.User, &e.Code, &e.Status, &e.CreatedAt, &e.ExpiresAt, &e.Replaces)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return &e, err
+}
+
+func (s *Store) Enrollment(ctx context.Context, id string) (*Enrollment, error) {
+	return scanEnrollment(s.db.QueryRowContext(ctx, `SELECT `+enrollmentCols+` FROM enrollments WHERE id = ?`, id))
+}
+
+// EnrollmentByToken returns the enrollment that handed out token.
+func (s *Store) EnrollmentByToken(ctx context.Context, token string) (*Enrollment, error) {
+	return scanEnrollment(s.db.QueryRowContext(ctx, `SELECT `+enrollmentCols+` FROM enrollments WHERE token_hash = ?`, hash(token)))
+}
+
+// PendingEnrollments returns live enrollments, oldest first.
+func (s *Store) PendingEnrollments(ctx context.Context) ([]Enrollment, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+enrollmentCols+` FROM enrollments
+		WHERE status = ? AND expires_at > ? ORDER BY created_at, rowid`, protocol.StatusPending, now())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Enrollment
+	for rows.Next() {
+		e, err := scanEnrollment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *e)
+	}
+	return out, rows.Err()
+}
+
+// ResolveEnrollment moves a live pending enrollment to status. Approving it
+// registers the dev box with the enrollment's token, or gives a registered
+// dev box of the same name that token instead of its old one.
+func (s *Store) ResolveEnrollment(ctx context.Context, id, status string) (*Enrollment, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	e, err := scanEnrollment(tx.QueryRowContext(ctx, `SELECT `+enrollmentCols+` FROM enrollments WHERE id = ?`, id))
+	if err != nil {
+		return nil, err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE enrollments SET status = ?, resolved_at = ?
+		WHERE id = ? AND status = ? AND expires_at > ?`, status, now(), id, protocol.StatusPending, now())
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrNotPending
+	}
+	if status == protocol.StatusApproved {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO devboxes(name, token_hash, created_at)
+			SELECT name, token_hash, ? FROM enrollments WHERE id = ?
+			ON CONFLICT(name) DO UPDATE SET token_hash = excluded.token_hash`, now(), id); err != nil {
+			return nil, err
+		}
+	}
+	e.Status = status
+	return e, tx.Commit()
 }
 
 // Pairing codes and nonces
@@ -504,17 +637,17 @@ func (s *Store) Sweep(ctx context.Context, retention time.Duration) (bool, error
 	}
 	n, _ := res.RowsAffected()
 	cutoff := time.Now().Add(-retention).Unix()
-	for _, q := range []string{
-		`DELETE FROM requests WHERE status != 'pending' AND resolved_at < ?`,
-		`DELETE FROM nonces WHERE expires_at < ?`,
-		`DELETE FROM pair_codes WHERE expires_at < ?`,
-		`DELETE FROM sessions WHERE expires_at < ?`,
+	for _, d := range []struct {
+		query string
+		arg   int64
+	}{
+		{`DELETE FROM requests WHERE status != 'pending' AND resolved_at < ?`, cutoff},
+		{`DELETE FROM enrollments WHERE expires_at < ?`, cutoff},
+		{`DELETE FROM nonces WHERE expires_at < ?`, t},
+		{`DELETE FROM pair_codes WHERE expires_at < ?`, t},
+		{`DELETE FROM sessions WHERE expires_at < ?`, t},
 	} {
-		arg := t
-		if strings.Contains(q, "requests") {
-			arg = cutoff
-		}
-		if _, err := s.db.ExecContext(ctx, q, arg); err != nil {
+		if _, err := s.db.ExecContext(ctx, d.query, d.arg); err != nil {
 			return n > 0, err
 		}
 	}

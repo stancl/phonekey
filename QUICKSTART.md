@@ -79,21 +79,6 @@ once you trust the setup.
 
 ## 3. The dev box
 
-Register it on the backend host, and keep the token it prints; it's only shown
-once:
-
-```sh
-sudo phonekeyd-ctl you devbox add mydevbox
-```
-
-On the dev box, store the token where only you can read it:
-
-```sh
-mkdir -p ~/.config/phonekey
-echo 'pkd_…' > ~/.config/phonekey/token
-chmod 600 ~/.config/phonekey/token
-```
-
 In the dev box's system flake (with the same `phonekey` input as above; on
 the same machine as the backend, `phonekey.nixosModules.default` brings both
 modules):
@@ -118,7 +103,8 @@ phonekey.nixosModules.phonekey-agent
 
 That gives `you`:
 - the agent as a systemd user service
-- `phonekey-agent`, `phonekey-keygen` and `phonekey-use` in your `PATH`
+- `phonekey-agent`, `phonekey-keygen`, `phonekey-use` and `phonekey-enroll` in
+  your `PATH`
 - for the hosts in `ssh.hosts`, ssh going through the agent, logging in with
   only the key `~/.ssh/active_auth.pub` points at. Every other host keeps your
   usual setup: your `~/.ssh` keys and `SSH_AUTH_SOCK`.
@@ -142,9 +128,22 @@ what lets the phone show jj's commits. See
 
 ```sh
 sudo nixos-rebuild switch --flake /etc/nixos#mydevbox
-systemctl --user start phonekey-agent      # from the next login on it starts by itself
+phonekey-enroll                            # optionally --name mydevbox; the default is the hostname
+```
+
+`phonekey-enroll` asks the backend to register the dev box and prints a code.
+The phone gets a notification: open the *Add a dev box* card, check that it
+shows the same code, and tap **Approve**. Once you have, the command stores
+the dev box's token in `~/.config/phonekey/token` and (re)starts the agent.
+From the next login on it starts by itself. Its log:
+
+```sh
 journalctl --user -u phonekey-agent -f
 ```
+
+Without the phone at hand, `sudo phonekeyd-ctl you devbox add mydevbox` on the
+backend host prints a token instead. Put it in `~/.config/phonekey/token`
+(mode 600) and run `systemctl --user start phonekey-agent`.
 
 Until you've finished step 4, ssh to the hosts in `ssh.hosts` fails for you:
 it already goes through the agent and `~/.ssh/active_auth.pub`.
@@ -297,8 +296,9 @@ needed unless the hostname changes.
 machine, keys, dev boxes and notifications. Starting fresh under the same
 hostname instead, delete the old machine in the Tailscale admin console, pair
 with **Use an existing passkey** (the same key, so GitHub stays as it is), tap
-**Enable notifications** again, and register the dev boxes again. A new
-hostname means a new passkey and key.
+**Enable notifications** again, and enroll the dev boxes again (remove
+`~/.config/phonekey/token` on each, then `phonekey-enroll`). A new hostname
+means a new passkey and key.
 
 ## When something's off
 
@@ -309,7 +309,7 @@ hostname means a new passkey and key.
   1Password keys while the forwarded agent isn't connected. GitHub also only
   asks for a signature with a key registered there as an Authentication key.
 - **The agent doesn't start:** it's skipped while `~/.config/phonekey/token`
-  doesn't exist. Once it does: `systemctl --user start phonekey-agent`.
+  doesn't exist. `phonekey-enroll` gets one and starts it.
 - **No notification:** check **Send test** in the app, and that the request
   shows up in the app at all (if so, it's the notification side). The
   backend logs what the push service answered:

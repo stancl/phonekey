@@ -9,6 +9,7 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   config: null,
+  enrollments: [],
   pending: [],
   selected: new Set(),
   highlight: new URLSearchParams(location.search).get("req"),
@@ -270,6 +271,14 @@ async function approve(withGrant) {
   if (errors.length) throw new Error(errors.join("\n"));
 }
 
+async function approveEnrollment(e) {
+  await api("POST", `/api/web/enrollments/${e.id}/approve`, { approval: await approval() });
+}
+
+async function denyEnrollment(e) {
+  await api("POST", `/api/web/enrollments/${e.id}/deny`, {});
+}
+
 async function deny() {
   const ids = [...state.selected];
   for (const id of ids) {
@@ -387,6 +396,10 @@ function connectEvents() {
   if (state.events) state.events.close();
   const es = new EventSource("/api/web/events");
   state.events = es;
+  es.addEventListener("enrollments", (ev) => {
+    state.enrollments = JSON.parse(ev.data);
+    renderEnrollments();
+  });
   es.addEventListener("requests", (ev) => {
     $("conn").textContent = "live";
     state.pending = JSON.parse(ev.data);
@@ -405,7 +418,7 @@ function connectEvents() {
     renderRequests();
     runGrant();
     if ($("history-details").open) renderHistory().catch(setError);
-    closeNotifications(ids);
+    closeNotifications(new Set([...ids, ...state.enrollments.map((e) => e.id)]));
   });
   es.onerror = () => {
     $("conn").textContent = "reconnecting…";
@@ -559,6 +572,46 @@ function renderContext(c) {
   return h("div", { class: "unverified" }, h("div", { class: "block-label" }, "Dev box says (not verified)"), parts);
 }
 
+// renderEnrollments shows dev boxes asking to be registered. The code is what
+// `phonekey-agent enroll` printed on the dev box: it's what ties a card to the
+// machine in front of you rather than to anyone else on the network.
+function renderEnrollments() {
+  const now = Date.now() / 1000;
+  $("enrollment-list").replaceChildren(
+    ...state.enrollments.map((e) => {
+      const left = Math.max(0, Math.round(e.expires_at - now));
+      return h(
+        "li",
+        { class: "card" + (e.id === state.highlight ? " highlight" : "") },
+        h("div", { class: "card-title" }, e.replaces ? "Replace a dev box" : "Add a dev box"),
+        h("div", { class: "card-meta", "data-expires": e.expires_at }, `${e.name} · ${left}s left`),
+        h("div", { class: "enroll-code" }, e.code),
+        e.replaces &&
+          h(
+            "p",
+            { class: "warning" },
+            `A dev box named ${e.name} is already registered. Approving cuts it off: its token stops working, and this one takes its place, with its requests showing as ${e.name}.`,
+          ),
+        h("p", { class: "muted" }, "Approve only if phonekey-agent enroll shows this code on the dev box. It can then ask for signatures, which you approve here as usual."),
+        kv([["Name", e.name]]),
+        (e.host || e.user) &&
+          h("div", { class: "unverified" }, h("div", { class: "block-label" }, "Dev box says (not verified)"), kv([["Host", e.host], ["User", e.user]])),
+        h(
+          "div",
+          { class: "row card-actions" },
+          h("button", { onclick: () => approveEnrollment(e).catch(setError) }, e.replaces ? "Replace" : "Approve"),
+          h("button", { class: "danger", onclick: () => denyEnrollment(e).catch(setError) }, "Deny"),
+        ),
+      );
+    }),
+  );
+  renderEmpty();
+}
+
+function renderEmpty() {
+  show("empty", !state.pending.length && !state.enrollments.length);
+}
+
 function renderRequests() {
   const list = $("request-list");
   list.replaceChildren();
@@ -590,7 +643,7 @@ function renderRequests() {
       ),
     );
   }
-  show("empty", !state.pending.length);
+  renderEmpty();
   renderActions();
 }
 

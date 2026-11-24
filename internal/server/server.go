@@ -10,8 +10,11 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +41,11 @@ type Config struct {
 	SessionTTL time.Duration
 	Retention  time.Duration
 	MaxGrant   time.Duration
+	// EnrollTTL is how long a dev box's enrollment waits for approval.
+	EnrollTTL time.Duration
+	// MaxEnrollments caps the enrollments asked for within EnrollTTL.
+	// Anyone who can reach phonekeyd can ask, and each sends a push.
+	MaxEnrollments int
 	// PushHoldBack is how long a new request waits before its push when the
 	// page may hold a grant that will sign it right away.
 	PushHoldBack time.Duration
@@ -75,6 +83,12 @@ func (c *Config) defaults() {
 	}
 	if c.Retention == 0 {
 		c.Retention = 7 * 24 * time.Hour
+	}
+	if c.EnrollTTL == 0 {
+		c.EnrollTTL = 5 * time.Minute
+	}
+	if c.MaxEnrollments == 0 {
+		c.MaxEnrollments = 3
 	}
 	if c.PushHoldBack == 0 {
 		c.PushHoldBack = 2 * time.Second
@@ -149,6 +163,9 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/devbox/requests/{id}", s.devbox(s.pollRequest))
 	m.HandleFunc("DELETE /api/devbox/requests/{id}", s.devbox(s.cancelRequest))
 	m.HandleFunc("GET /api/devbox/keys", s.devbox(s.devboxKeys))
+	m.HandleFunc("POST /api/devbox/enroll", s.enroll)
+	m.HandleFunc("GET /api/devbox/enroll", s.enrollment(s.pollEnrollment))
+	m.HandleFunc("DELETE /api/devbox/enroll", s.enrollment(s.cancelEnrollment))
 
 	m.HandleFunc("GET /api/web/config", s.webConfig)
 	m.HandleFunc("POST /api/web/nonce", s.sameOrigin(s.nonce))
@@ -161,6 +178,9 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/web/requests/{id}/signature", s.sameOrigin(s.session(s.submitSignature)))
 	m.HandleFunc("POST /api/web/requests/{id}/deny", s.sameOrigin(s.session(s.denyRequest)))
 	m.HandleFunc("DELETE /api/web/keys/{id}", s.sameOrigin(s.session(s.removeKey)))
+	m.HandleFunc("GET /api/web/enrollments", s.session(s.listEnrollments))
+	m.HandleFunc("POST /api/web/enrollments/{id}/approve", s.sameOrigin(s.session(s.approveEnrollment)))
+	m.HandleFunc("POST /api/web/enrollments/{id}/deny", s.sameOrigin(s.session(s.denyEnrollment)))
 	m.HandleFunc("POST /api/web/push/subscribe", s.sameOrigin(s.session(s.subscribe)))
 	m.HandleFunc("POST /api/web/push/test", s.sameOrigin(s.session(s.testPush)))
 
@@ -269,11 +289,19 @@ func normalizeKey(k ssh.PublicKey) string {
 
 // Dev box API
 
+func bearer(r *http.Request) (string, error) {
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
+		return "", errorf(http.StatusUnauthorized, "missing bearer token")
+	}
+	return token, nil
+}
+
 func (s *Server) devbox(h func(http.ResponseWriter, *http.Request, *store.Devbox)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok {
-			s.fail(w, r, errorf(http.StatusUnauthorized, "missing bearer token"))
+		token, err := bearer(r)
+		if err != nil {
+			s.fail(w, r, err)
 			return
 		}
 		d, err := s.store.DevboxByToken(r.Context(), token)
@@ -363,43 +391,56 @@ func (s *Server) notify(ctx context.Context, id, scope string, msg PushMessage) 
 	s.push.send(ctx, msg)
 }
 
-func effectiveStatus(r *store.Request) string {
-	if r.Status == protocol.StatusPending && r.ExpiresAt <= time.Now().Unix() {
+func effectiveStatus(status string, expiresAt int64) string {
+	if status == protocol.StatusPending && expiresAt <= time.Now().Unix() {
 		return protocol.StatusExpired
 	}
-	return r.Status
+	return status
 }
 
-func (s *Server) pollRequest(w http.ResponseWriter, r *http.Request, d *store.Devbox) {
-	id := r.PathValue("id")
+// longPoll answers with what state returns once that's no longer pending, or
+// with the pending state after ?wait=N seconds. It asks state again whenever
+// anything changes, and when the pending state expires.
+func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, state func() (*protocol.RequestState, int64, error)) {
 	wait, _ := strconv.Atoi(r.URL.Query().Get("wait"))
 	deadline := time.After(time.Duration(min(max(wait, 0), 60)) * time.Second)
 	for {
 		changed := s.events.wait()
-		req, err := s.store.Request(r.Context(), id)
-		if err == nil && req.DevboxID != d.ID {
-			err = store.ErrNotFound
-		}
+		st, expiresAt, err := state()
 		if err != nil {
 			s.fail(w, r, err)
 			return
 		}
-		status := effectiveStatus(req)
-		if status != protocol.StatusPending {
-			writeJSON(w, http.StatusOK, protocol.RequestState{ID: id, Status: status, Signature: req.Signature})
+		if st.Status != protocol.StatusPending {
+			writeJSON(w, http.StatusOK, st)
 			return
 		}
-		expiry := time.Until(time.Unix(req.ExpiresAt, 0)) + 100*time.Millisecond
+		expiry := time.Until(time.Unix(expiresAt, 0)) + 100*time.Millisecond
 		select {
 		case <-changed:
 		case <-time.After(expiry):
 		case <-deadline:
-			writeJSON(w, http.StatusOK, protocol.RequestState{ID: id, Status: status})
+			writeJSON(w, http.StatusOK, st)
 			return
 		case <-r.Context().Done():
 			return
 		}
 	}
+}
+
+func (s *Server) pollRequest(w http.ResponseWriter, r *http.Request, d *store.Devbox) {
+	id := r.PathValue("id")
+	s.longPoll(w, r, func() (*protocol.RequestState, int64, error) {
+		req, err := s.store.Request(r.Context(), id)
+		if err == nil && req.DevboxID != d.ID {
+			err = store.ErrNotFound
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+		status := effectiveStatus(req.Status, req.ExpiresAt)
+		return &protocol.RequestState{ID: id, Status: status, Signature: req.Signature}, req.ExpiresAt, nil
+	})
 }
 
 func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request, d *store.Devbox) {
@@ -429,6 +470,105 @@ func (s *Server) devboxKeys(w http.ResponseWriter, r *http.Request, d *store.Dev
 	for _, k := range keys {
 		fmt.Fprintf(w, "%s %s\n", k.PublicKey, strings.ReplaceAll(protocol.CleanLabel(k.Label), " ", "_"))
 	}
+}
+
+// devboxName is what an enrolling dev box may call itself: a hostname's
+// characters, so a name can't pass for anything else on the card, such as a
+// second code.
+var devboxName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// enroll lets a dev box ask to be registered, without a token. The page
+// shows the request with a code the dev box shows too, and approving it
+// takes a passkey.
+func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
+	// A web page can only send JSON to another origin after a CORS
+	// preflight, which phonekeyd doesn't allow, so this keeps any site a
+	// browser on the tailnet opens from asking.
+	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt != "application/json" {
+		s.fail(w, r, errorf(http.StatusUnsupportedMediaType, "expected application/json"))
+		return
+	}
+	var req protocol.EnrollRequest
+	if err := decode(r, &req); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if !devboxName.MatchString(req.Name) {
+		s.fail(w, r, errorf(http.StatusBadRequest, "the dev box name must be 1 to 64 letters, digits, dots, dashes or underscores"))
+		return
+	}
+	req.Host = truncate(protocol.CleanLabel(req.Host), 64)
+	req.User = truncate(protocol.CleanLabel(req.User), 64)
+	resp, err := s.store.CreateEnrollment(r.Context(), req, s.cfg.EnrollTTL, s.cfg.MaxEnrollments)
+	if errors.Is(err, store.ErrTooManyEnrollments) {
+		s.fail(w, r, errorf(http.StatusTooManyRequests, "%v", err))
+		return
+	} else if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	e, err := s.store.Enrollment(r.Context(), resp.ID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.log.Info("dev box enrollment requested", "id", e.ID, "name", e.Name, "host", e.Host, "code", e.Code, "replaces", e.Replaces)
+	s.events.notify()
+	title := "Add a dev box?"
+	if e.Replaces {
+		title = "Replace a dev box?"
+	}
+	go s.push.send(context.WithoutCancel(r.Context()), PushMessage{
+		ID: e.ID, Title: title, Body: fmt.Sprintf("%s, code %s", e.Name, e.Code),
+	})
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+// enrollment authenticates a dev box by the token its enrollment handed
+// out, approved or not.
+func (s *Server) enrollment(h func(http.ResponseWriter, *http.Request, *store.Enrollment)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token, err := bearer(r)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		e, err := s.store.EnrollmentByToken(r.Context(), token)
+		if errors.Is(err, store.ErrNotFound) {
+			s.fail(w, r, errorf(http.StatusUnauthorized, "unknown enrollment token"))
+			return
+		} else if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		h(w, r, e)
+	}
+}
+
+func (s *Server) pollEnrollment(w http.ResponseWriter, r *http.Request, e *store.Enrollment) {
+	s.longPoll(w, r, func() (*protocol.RequestState, int64, error) {
+		cur, err := s.store.Enrollment(r.Context(), e.ID)
+		if err != nil {
+			return nil, 0, err
+		}
+		return &protocol.RequestState{ID: cur.ID, Status: effectiveStatus(cur.Status, cur.ExpiresAt)}, cur.ExpiresAt, nil
+	})
+}
+
+// cancelEnrollment withdraws a pending enrollment and answers with how the
+// enrollment ended, which may be an approval that came first.
+func (s *Server) cancelEnrollment(w http.ResponseWriter, r *http.Request, e *store.Enrollment) {
+	if _, err := s.store.ResolveEnrollment(r.Context(), e.ID, protocol.StatusCancelled); err != nil && !errors.Is(err, store.ErrNotPending) {
+		s.fail(w, r, err)
+		return
+	}
+	s.events.notify()
+	cur, err := s.store.Enrollment(r.Context(), e.ID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, protocol.RequestState{ID: cur.ID, Status: effectiveStatus(cur.Status, cur.ExpiresAt)})
 }
 
 // Web API
@@ -642,7 +782,7 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) removeKey(w http.ResponseWriter, r *http.Request) {
-	var req protocol.RemoveKeyRequest
+	var req protocol.Approved
 	if err := decode(r, &req); err != nil {
 		s.fail(w, r, err)
 		return
@@ -685,6 +825,60 @@ func (s *Server) pending(ctx context.Context) ([]protocol.WebRequest, error) {
 	return out, nil
 }
 
+func (s *Server) pendingEnrollments(ctx context.Context) ([]protocol.WebEnrollment, error) {
+	es, err := s.store.PendingEnrollments(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]protocol.WebEnrollment, 0, len(es))
+	for _, e := range es {
+		out = append(out, e.WebEnrollment)
+	}
+	return out, nil
+}
+
+func (s *Server) listEnrollments(w http.ResponseWriter, r *http.Request) {
+	es, err := s.pendingEnrollments(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, es)
+}
+
+// approveEnrollment registers a dev box. Like changing the keys, that takes a
+// passkey approval, not just a session.
+func (s *Server) approveEnrollment(w http.ResponseWriter, r *http.Request) {
+	var req protocol.Approved
+	if err := decode(r, &req); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if err := s.checkApproval(r, req.Approval); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.resolveEnrollment(w, r, protocol.StatusApproved)
+}
+
+func (s *Server) denyEnrollment(w http.ResponseWriter, r *http.Request) {
+	s.resolveEnrollment(w, r, protocol.StatusDenied)
+}
+
+func (s *Server) resolveEnrollment(w http.ResponseWriter, r *http.Request, status string) {
+	e, err := s.store.ResolveEnrollment(r.Context(), r.PathValue("id"), status)
+	if errors.Is(err, store.ErrNotPending) {
+		s.fail(w, r, errorf(http.StatusConflict, "the dev box enrollment is no longer pending"))
+		return
+	} else if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.log.Info("dev box enrollment "+status, "id", e.ID, "name", e.Name, "replaces", e.Replaces)
+	s.events.notify()
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 	reqs, err := s.pending(r.Context())
 	if err != nil {
@@ -712,8 +906,9 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// eventStream pushes the pending list over server-sent events whenever it
-// changes. Grants on the page depend on this live connection.
+// eventStream pushes the pending enrollments and requests over server-sent
+// events whenever they change. Grants on the page depend on this live
+// connection.
 func (s *Server) eventStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -736,21 +931,30 @@ func (s *Server) eventStream(w http.ResponseWriter, r *http.Request) {
 		if !live() {
 			return
 		}
+		enrollments, err := s.pendingEnrollments(r.Context())
+		if err != nil {
+			return
+		}
 		reqs, err := s.pending(r.Context())
 		if err != nil {
 			return
 		}
-		b, _ := json.Marshal(reqs)
+		b, _ := json.Marshal(enrollments)
+		fmt.Fprintf(w, "event: enrollments\ndata: %s\n\n", b)
+		b, _ = json.Marshal(reqs)
 		fmt.Fprintf(w, "event: requests\ndata: %s\n\n", b)
 		flusher.Flush()
-		// Wake up when the earliest request expires so the page drops it.
+		// Wake up when the earliest one expires so the page drops it.
+		var expires []int64
+		for _, e := range enrollments {
+			expires = append(expires, e.ExpiresAt)
+		}
+		for _, q := range reqs {
+			expires = append(expires, q.ExpiresAt)
+		}
 		var expiry <-chan time.Time
-		if len(reqs) > 0 {
-			soonest := reqs[0].ExpiresAt
-			for _, q := range reqs {
-				soonest = min(soonest, q.ExpiresAt)
-			}
-			expiry = time.After(time.Until(time.Unix(soonest, 0)) + 100*time.Millisecond)
+		if len(expires) > 0 {
+			expiry = time.After(time.Until(time.Unix(slices.Min(expires), 0)) + 100*time.Millisecond)
 		}
 	wait:
 		select {

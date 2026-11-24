@@ -16,6 +16,8 @@ const (
 	StatusDenied    = "denied"
 	StatusExpired   = "expired"
 	StatusCancelled = "cancelled"
+	// StatusApproved ends a dev box enrollment that was approved.
+	StatusApproved = "approved"
 )
 
 // Context is what the dev box tells the approver about a request. It helps a
@@ -80,11 +82,44 @@ type CreateResponse struct {
 	ExpiresAt int64  `json:"expires_at"`
 }
 
-// RequestState is returned by the agent's long-poll.
+// RequestState is returned by the agent's long-polls, for a signature request
+// or for its enrollment.
 type RequestState struct {
 	ID        string `json:"id"`
 	Status    string `json:"status"`
 	Signature []byte `json:"signature,omitempty"` // raw 64-byte ed25519 signature
+}
+
+// EnrollRequest is POSTed, without a token, to /api/devbox/enroll by
+// `phonekey-agent enroll`. Host and User are what the dev box says about
+// itself, shown on the page next to the name.
+type EnrollRequest struct {
+	Name string `json:"name"`
+	Host string `json:"host,omitempty"`
+	User string `json:"user,omitempty"`
+}
+
+// EnrollResponse hands the dev box its token, which works once the
+// enrollment is approved on the page. The page shows the same Code.
+type EnrollResponse struct {
+	ID        string `json:"id"`
+	Token     string `json:"token"`
+	Code      string `json:"code"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+// WebEnrollment is a pending dev box enrollment as shown to the page.
+type WebEnrollment struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Host string `json:"host,omitempty"`
+	User string `json:"user,omitempty"`
+	Code string `json:"code"`
+	// Replaces is set when a dev box with this name is already registered:
+	// approving gives it the new token, and the old one stops working.
+	Replaces  bool  `json:"replaces,omitempty"`
+	CreatedAt int64 `json:"created_at"`
+	ExpiresAt int64 `json:"expires_at"`
 }
 
 // WebRequest is a pending request as shown to the approval page.
@@ -131,9 +166,9 @@ type LoginRequest struct {
 	Signature []byte `json:"signature"`
 }
 
-// Approval proves that a change to the registered keys comes from someone
-// holding a registered passkey right now, not just a session cookie: a
-// registered key's signature over AuthMessage(Nonce).
+// Approval proves that a change to the registered keys or dev boxes comes
+// from someone holding a registered passkey right now, not just a session
+// cookie: a registered key's signature over AuthMessage(Nonce).
 type Approval struct {
 	PublicKey string `json:"public_key"`
 	Nonce     string `json:"nonce"`
@@ -152,7 +187,9 @@ type PairRequest struct {
 	Approval     *Approval `json:"approval,omitempty"`
 }
 
-type RemoveKeyRequest struct {
+// Approved is the body of web API calls that need an Approval: removing a
+// key, adding a dev box.
+type Approved struct {
 	Approval *Approval `json:"approval"`
 }
 
